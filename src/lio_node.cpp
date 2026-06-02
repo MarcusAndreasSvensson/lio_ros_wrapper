@@ -151,6 +151,9 @@ public:
         // Configure gravity
         estimator_->m_params.gravity = config_.imu.gravity.cast<float>();
         
+        // Configure IMU accelerometer scale (9.81 for g-units like Livox, 1.0 for m/s² like Hesai)
+        estimator_->m_params.acc_scale = config_.imu.acc_scale;
+        
         // Update process noise matrix
         estimator_->UpdateProcessNoise();
         
@@ -367,7 +370,7 @@ private:
             if (last_timestamp >= 0.0 && event.timestamp < last_timestamp) {
                 double diff = event.timestamp - last_timestamp;
                 if (diff < -0.01) {  // -10ms threshold
-                    RCLCPP_ERROR(this->get_logger(), 
+                    RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
                                 "TIMESTAMP ORDER VIOLATION! last=%.9f, current=%.9f (diff=%.9f)",
                                 last_timestamp, event.timestamp, diff);
                 } else {
