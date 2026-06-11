@@ -24,6 +24,7 @@
 #include <vector>
 #include <thread>
 #include <atomic>
+#include <chrono>
 
 // LIO includes
 #include "Estimator.h"
@@ -352,6 +353,12 @@ private:
         size_t processed_count = 0;
         size_t lidar_processed = 0;
         size_t imu_processed = 0;
+
+        double imu_time_ms = 0.0;
+        double lidar_estimator_ms = 0.0;
+        double lidar_publish_ms = 0.0;
+        auto profile_start = std::chrono::steady_clock::now();
+        auto last_profile_log = profile_start;
         
         double last_timestamp = -1.0;  // For timestamp ordering check
         
@@ -383,50 +390,66 @@ private:
             
             try {
                 if (event.type == SensorType::IMU) {
-                    // Process IMU (propagate state)
+                    auto t0 = std::chrono::steady_clock::now();
                     estimator_->ProcessIMU(*event.imu_data);
+                    imu_time_ms += std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count();
                     imu_processed++;
                     
-                    RCLCPP_DEBUG(this->get_logger(), "[%zu] IMU @ %.9f | acc=[%.3f, %.3f, %.3f] gyr=[%.3f, %.3f, %.3f]", 
-                                processed_count, event.timestamp,
-                                event.imu_data->acc.x(),
-                                event.imu_data->acc.y(),
-                                event.imu_data->acc.z(),
-                                event.imu_data->gyr.x(),
-                                event.imu_data->gyr.y(),
-                                event.imu_data->gyr.z());
-                    
                 } else {
-                    // Process LiDAR (scan matching + update)
+                    const size_t raw_points = event.lidar_data->cloud->size();
+
+                    auto t0 = std::chrono::steady_clock::now();
                     estimator_->ProcessLidar(*event.lidar_data);
+                    const double estimator_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count();
+                    lidar_estimator_ms += estimator_ms;
                     lidar_processed++;
-                    
-                    RCLCPP_DEBUG(this->get_logger(), 
-                                "[%zu] LiDAR @ %.9f | Points: %zu | Queue: %zu", 
-                                processed_count, event.timestamp, event.lidar_data->cloud->size(),
-                                event_queue_.size());
-                    
-                    // Get current state
+
+                    auto t_pub = std::chrono::steady_clock::now();
                     State current_state = estimator_->GetCurrentState();
-                    
-                    // Publish pose and odometry immediately after LiDAR update (synchronized)
                     publishPoseOnly(current_state, event.timestamp);
                     publishOdometry(current_state, event.timestamp);
-                    
-                    // Publish raw scan immediately (if there are subscribers)
+
                     if (raw_scan_pub_->get_subscription_count() > 0) {
                         rclcpp::Time ros_time(static_cast<int64_t>(event.timestamp * 1e9));
                         publishRawScan(event.lidar_data->cloud, current_state, ros_time);
                     }
-                    
-                    // Prepare result for publisher thread (other visualizations)
+
                     LIOProcessingResult result;
                     result.success = true;
                     result.timestamp = event.timestamp;
                     result.state = current_state;
                     result.processed_cloud = estimator_->GetProcessedCloud();
-                    result.raw_cloud = nullptr;  // Already published in processing thread
+                    result.raw_cloud = nullptr;
                     result_queue_.push(result);
+
+                    const double publish_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t_pub).count();
+                    lidar_publish_ms += publish_ms;
+
+                    RCLCPP_INFO(this->get_logger(),
+                        "[PROFILE] LiDAR #%zu raw_pts=%zu proc_pts=%zu queue=%zu | "
+                        "estimator=%.2fms publish=%.2fms total=%.2fms",
+                        lidar_processed, raw_points,
+                        result.processed_cloud ? result.processed_cloud->size() : 0,
+                        event_queue_.size(),
+                        estimator_ms, publish_ms, estimator_ms + publish_ms);
+                }
+
+                const auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration<double>(now - last_profile_log).count() >= 1.0) {
+                    const double elapsed = std::chrono::duration<double>(now - profile_start).count();
+                    RCLCPP_INFO(this->get_logger(),
+                        "[PROFILE] %.1fs | processed %zu evt (%zu IMU, %zu LiDAR) @ %.1f evt/s | "
+                        "queue=%zu | avg IMU=%.3fms | avg LiDAR est=%.1fms pub=%.1fms",
+                        elapsed, processed_count, imu_processed, lidar_processed,
+                        processed_count / std::max(elapsed, 1e-6),
+                        event_queue_.size(),
+                        imu_processed ? imu_time_ms / imu_processed : 0.0,
+                        lidar_processed ? lidar_estimator_ms / lidar_processed : 0.0,
+                        lidar_processed ? lidar_publish_ms / lidar_processed : 0.0);
+                    last_profile_log = now;
                 }
                 
             } catch (const std::exception& e) {
@@ -434,10 +457,19 @@ private:
                             "Exception in LIO processing: %s", e.what());
             }
         }
-        
-        RCLCPP_INFO(this->get_logger(), 
-                   "Processing thread stopped (processed %zu events: %zu IMU, %zu LiDAR)", 
-                   processed_count, imu_processed, lidar_processed);
+
+        const double total_elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - profile_start).count();
+        RCLCPP_INFO(this->get_logger(),
+                   "Processing thread stopped (processed %zu events: %zu IMU, %zu LiDAR in %.2fs @ %.1f evt/s)",
+                   processed_count, imu_processed, lidar_processed,
+                   total_elapsed, processed_count / std::max(total_elapsed, 1e-6));
+        RCLCPP_INFO(this->get_logger(),
+                   "[PROFILE] totals: IMU=%.1fms (avg %.3fms) | LiDAR estimator=%.1fms (avg %.1fms) | "
+                   "LiDAR publish=%.1fms (avg %.1fms)",
+                   imu_time_ms, imu_processed ? imu_time_ms / imu_processed : 0.0,
+                   lidar_estimator_ms, lidar_processed ? lidar_estimator_ms / lidar_processed : 0.0,
+                   lidar_publish_ms, lidar_processed ? lidar_publish_ms / lidar_processed : 0.0);
     }
     
     // Publisher Thread: Publish ROS topics
@@ -602,10 +634,20 @@ private:
         
         // 2. Raw scan already published in processing thread
         
-        // 3. Publish map (RED)
-        auto map_cloud = estimator_->GetMapPointCloud();
-        if (map_cloud && !map_cloud->empty()) {
-            publishMapCloud(map_cloud, ros_time);
+        // 3. Publish map (RED). The local map grows unbounded; serializing it
+        //    every frame eventually overflows the FastCDR buffer and kills the
+        //    node. Only build/publish when (a) someone is subscribed and
+        //    (b) at most map_pub_max_rate_hz_, then decimate to a point cap.
+        if (map_cloud_pub_->get_subscription_count() > 0) {
+            const double now_sec = result.timestamp;
+            if (now_sec - last_map_pub_time_ >= 1.0 / map_pub_max_rate_hz_) {
+                last_map_pub_time_ = now_sec;
+                auto map_cloud = estimator_->GetMapPointCloud();
+                if (map_cloud && !map_cloud->empty()) {
+                    map_cloud = decimateCloud(map_cloud, map_pub_max_points_);
+                    publishMapCloud(map_cloud, ros_time);
+                }
+            }
         }
         
         // 4. Publish trajectory
@@ -702,6 +744,22 @@ private:
         raw_scan_pub_->publish(cloud_msg);
     }
     
+    // Uniformly decimate a cloud down to at most max_points by striding, so the
+    // serialized /lio/map message stays bounded regardless of map growth.
+    static PointCloudPtr decimateCloud(const PointCloudPtr& cloud, size_t max_points)
+    {
+        if (!cloud || max_points == 0 || cloud->size() <= max_points) {
+            return cloud;
+        }
+        const size_t stride = (cloud->size() + max_points - 1) / max_points;
+        auto out = std::make_shared<PointCloud>();
+        out->reserve(max_points);
+        for (size_t i = 0; i < cloud->size(); i += stride) {
+            out->push_back(cloud->at(i));
+        }
+        return out;
+    }
+
     void publishMapCloud(const PointCloudPtr& cloud, const rclcpp::Time& timestamp)
     {
         sensor_msgs::msg::PointCloud2 cloud_msg;
@@ -799,6 +857,11 @@ private:
     
     // Trajectory storage
     nav_msgs::msg::Path trajectory_;
+
+    // Map visualization throttling (prevents unbounded /lio/map serialization)
+    double last_map_pub_time_ = 0.0;       // last map publish time (sensor clock, s)
+    double map_pub_max_rate_hz_ = 1.0;     // cap map publishing to this rate
+    size_t map_pub_max_points_ = 200000;   // decimate map cloud to this many points
 
     // LIO Estimator
     std::shared_ptr<Estimator> estimator_;
