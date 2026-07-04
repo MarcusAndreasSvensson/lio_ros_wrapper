@@ -282,13 +282,15 @@ private:
             }
         }
         
-        // Check if offset_time field exists
+        // Check per-point time field. The LIO undistortion expects a per-point
+        // offset in seconds from scan start (Point3D::offset_time). Two encodings
+        // are supported: legacy "offset_time" (uint32 ns, relative) and the Hesai
+        // driver's "timestamp" (float64 seconds, absolute lidar clock).
         bool has_offset_time = false;
+        bool has_timestamp = false;
         for (const auto& field : msg->fields) {
-            if (field.name == "offset_time") {
-                has_offset_time = true;
-                break;
-            }
+            if (field.name == "offset_time") has_offset_time = true;
+            else if (field.name == "timestamp") has_timestamp = true;
         }
         
         if (has_intensity && has_offset_time) {
@@ -304,6 +306,24 @@ private:
                 point.offset_time = static_cast<float>(static_cast<double>(*iter_offset_time) / 1e9);  // uint32 (ns) -> double -> float (sec)
                 cloud->push_back(point);
             }
+        } else if (has_intensity && has_timestamp) {
+            // Hesai JT128: per-point absolute time (float64, sec) in "timestamp".
+            // Convert to offset from scan start (= this message's header stamp,
+            // which the driver sets to the frame start time). Same lidar clock,
+            // so the (large) epoch offset cancels in the subtraction.
+            sensor_msgs::PointCloud2ConstIterator<float> iter_intensity(*msg, "intensity");
+            sensor_msgs::PointCloud2ConstIterator<double> iter_timestamp(*msg, "timestamp");
+            
+            for (; iter_x != iter_x.end(); ++iter_x, ++iter_y, ++iter_z, ++iter_intensity, ++iter_timestamp) {
+                Point3D point;
+                point.x = *iter_x;
+                point.y = *iter_y;
+                point.z = *iter_z;
+                point.intensity = *iter_intensity;
+                double off = *iter_timestamp - timestamp;  // sec since frame start
+                point.offset_time = static_cast<float>(off > 0.0 ? off : 0.0);
+                cloud->push_back(point);
+            }
         } else if (has_intensity) {
             sensor_msgs::PointCloud2ConstIterator<float> iter_intensity(*msg, "intensity");
             
@@ -313,11 +333,11 @@ private:
                 point.y = *iter_y;
                 point.z = *iter_z;
                 point.intensity = *iter_intensity;
-                point.offset_time = 0.0f;  // No offset time
+                point.offset_time = 0.0f;  // No per-point time available
                 cloud->push_back(point);
             }
         } else {
-            // No intensity, no offset_time
+            // No intensity, no per-point time
             for (; iter_x != iter_x.end(); ++iter_x, ++iter_y, ++iter_z) {
                 Point3D point;
                 point.x = *iter_x;
